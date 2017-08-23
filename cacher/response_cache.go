@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
-	"os"
 	"time"
 
+	"github.com/go-midway/midway"
 	"github.com/go-midway/midway/logcontext"
 	rcache "gopkg.in/go-redis/cache.v5"
 	redis "gopkg.in/redis.v5"
@@ -28,6 +27,12 @@ func (err Error) Error() string {
 		return "header field not exits"
 	}
 	return "unknown error"
+}
+
+type rediser interface {
+	Set(key string, value interface{}, expiration time.Duration) *redis.StatusCmd
+	Get(key string) *redis.StringCmd
+	Del(keys ...string) *redis.IntCmd
 }
 
 // HKT stores *time.Location of Hong Kong
@@ -51,32 +56,6 @@ func parseRFC2612(str string) (t time.Time, err error) {
 		err = fmt.Errorf("cannot parse time %#v as RFC2612 (%#v)", str, terr.Layout)
 	}
 	return
-}
-
-var redisCache *rcache.Codec
-
-func init() {
-	redisURL, err := redis.ParseURL(os.Getenv("REDIS_URL"))
-	if err != nil {
-		log.Printf("invalid REDIS_URL: %s", err.Error())
-		return
-	}
-
-	// assign global redisCache
-	redisCache = &rcache.Codec{
-		Redis: redis.NewRing(&redis.RingOptions{
-			Addrs: map[string]string{
-				"default": redisURL.Addr,
-			},
-			Password: redisURL.Password,
-		}),
-		Marshal: func(v interface{}) ([]byte, error) {
-			return json.Marshal(v)
-		},
-		Unmarshal: func(b []byte, v interface{}) error {
-			return json.Unmarshal(b, v)
-		},
-	}
 }
 
 // NewResponseCache wraps an http.ResponswWriter with Cache
@@ -180,33 +159,58 @@ func keyOf(r *http.Request) (key string, err error) {
 	return
 }
 
-// Load cache for a given http request
-func Load(r *http.Request) (cache *ResponseCache, err error) {
+// Cacher handles the response cache for the CachedHandler
+type Cacher struct {
+	redisCache *rcache.Codec
+}
+
+// NewCacher returns a *ResponseCacher of the given redis options
+func NewCacher(opts *redis.Options) *Cacher {
+	return &Cacher{
+		redisCache: &rcache.Codec{
+			Redis: redis.NewRing(&redis.RingOptions{
+				Addrs: map[string]string{
+					"default": opts.Addr,
+				},
+				Password: opts.Password,
+			}),
+			Marshal: func(v interface{}) ([]byte, error) {
+				return json.Marshal(v)
+			},
+			Unmarshal: func(b []byte, v interface{}) error {
+				return json.Unmarshal(b, v)
+			},
+		},
+	}
+}
+
+// LoadResponse cache for a given http request
+func (rcacher Cacher) LoadResponse(r *http.Request) (cache *ResponseCache, err error) {
 	key, err := keyOf(r)
 	if err != nil {
 		return
 	}
 
-	if redisCache == nil {
+	if rcacher.redisCache == nil {
 		return
 	}
 
 	cache = &ResponseCache{}
-	if err = redisCache.Get(key, cache); err != nil {
+	if err = rcacher.redisCache.Get(key, cache); err != nil {
 		cache = nil
 		return
 	}
 	return
 }
 
-// Save cache for a given http request
-func Save(r *http.Request, cache *ResponseCache) (err error) {
+// SaveResponse cache for a given http request
+func (rcacher Cacher) SaveResponse(r *http.Request, cache *ResponseCache) (err error) {
 	key, err := keyOf(r)
 	if err != nil {
 		return
 	}
 
-	if redisCache == nil {
+	if rcacher.redisCache == nil {
 		return
 	}
 
@@ -215,25 +219,25 @@ func Save(r *http.Request, cache *ResponseCache) (err error) {
 	cache.CachedContent = cache.String()
 
 	// store the httpcache item in memcached
-	return redisCache.Set(&rcache.Item{
+	return rcacher.redisCache.Set(&rcache.Item{
 		Key:        key,
 		Object:     cache,
 		Expiration: 60 * time.Minute, // TODO: detect correct expiration time
 	})
 }
 
-// Delete deletes cache of a given request
-func Delete(r *http.Request) (err error) {
+// DeleteResponse deletes ResponseCache of a given request
+func (rcacher Cacher) DeleteResponse(r *http.Request) (err error) {
 	key, err := keyOf(r)
 	if err != nil {
 		return
 	}
 
-	if redisCache == nil {
+	if rcacher.redisCache == nil {
 		return
 	}
 
-	return redisCache.Delete(key)
+	return rcacher.redisCache.Delete(key)
 }
 
 // Valid test if a cache has valid cache
@@ -266,34 +270,36 @@ func Valid(r *http.Request, cache *ResponseCache) bool {
 }
 
 // CachedHandler applies httpcache to the wrapped http.Handler
-func CachedHandler(inner http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func CachedHandler(rcacher *Cacher) midway.Middleware {
+	return func(inner http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		logger := logcontext.GetComplexLogger(r.Context())
+			logger := logcontext.GetComplexLogger(r.Context())
 
-		// try to load cache for the request
-		cache, err := Load(r)
-		if err != nil {
-			logger.Error("message", fmt.Sprintf("error loading cache: %s", err.Error()))
-		}
-
-		// if has cache, write to ResponseWriter and return early
-		if Valid(r, cache) {
-			logger.Log("message", "use cache")
-			cache.WriteTo(w)
-			return // early return
-		}
-
-		// refresh cache by running inner handler
-		logger.Log("message", "no valid cache, trigger inner handler")
-
-		cache = NewResponseCache(w)
-		inner.ServeHTTP(cache, r)
-		go func() {
-			err := Save(r, cache)
+			// try to load cache for the request
+			cache, err := rcacher.LoadResponse(r)
 			if err != nil {
-				logger.Error("message", fmt.Sprintf("error saving cache: %s", err.Error()))
+				logger.Error("message", fmt.Sprintf("error loading cache: %s", err.Error()))
 			}
-		}()
-	})
+
+			// if has cache, write to ResponseWriter and return early
+			if Valid(r, cache) {
+				logger.Log("message", "use cache")
+				cache.WriteTo(w)
+				return // early return
+			}
+
+			// refresh cache by running inner handler
+			logger.Log("message", "no valid cache, trigger inner handler")
+
+			cache = NewResponseCache(w)
+			inner.ServeHTTP(cache, r)
+			go func() {
+				err := rcacher.SaveResponse(r, cache)
+				if err != nil {
+					logger.Error("message", fmt.Sprintf("error saving cache: %s", err.Error()))
+				}
+			}()
+		})
+	}
 }

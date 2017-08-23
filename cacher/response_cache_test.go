@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	redis "gopkg.in/redis.v5"
+
 	kitlog "github.com/go-kit/kit/log"
 	"github.com/go-midway/midway"
 	"github.com/go-midway/midway/cacher"
@@ -140,14 +142,21 @@ func TestResponseCache_Load(t *testing.T) {
 		t.Skip("REDIS_URL not set, test skipped")
 	}
 
-	_, err := cacher.Load(nil)
+	redisOpts, err := redis.ParseURL(os.Getenv("REDIS_URL"))
+	if err != nil {
+		t.Errorf("invalid REDIS_URL: %s", err.Error())
+		return
+	}
+	rcacher := cacher.NewCacher(redisOpts)
+
+	_, err = rcacher.LoadResponse(nil)
 	if err == nil {
 		t.Errorf("expected error, got nil")
 	}
 
 	r, _ := http.NewRequest("GET", "", nil)
 	r.URL = nil
-	_, err = cacher.Load(r)
+	_, err = rcacher.LoadResponse(r)
 	if err == nil {
 		t.Errorf("expected error, got nil")
 	}
@@ -158,6 +167,13 @@ func TestCachedHandler(t *testing.T) {
 	if url := os.Getenv("REDIS_URL"); url == "" {
 		t.Skip("REDIS_URL not set, test skipped")
 	}
+
+	redisOpts, err := redis.ParseURL(os.Getenv("REDIS_URL"))
+	if err != nil {
+		t.Errorf("invalid REDIS_URL: %s", err.Error())
+		return
+	}
+	rcacher := cacher.NewCacher(redisOpts)
 
 	// handler to be wrapped
 	calledHandler := 0
@@ -170,7 +186,7 @@ func TestCachedHandler(t *testing.T) {
 	})
 
 	// serve request for handler
-	handler = cacher.CachedHandler(handler)
+	handler = cacher.CachedHandler(rcacher)(handler)
 	w := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/some/path.html", nil)
 	handler.ServeHTTP(w, r)
@@ -189,7 +205,7 @@ func TestCachedHandler(t *testing.T) {
 	}
 
 	// examine the cached content
-	cache, err := cacher.Load(r)
+	cache, err := rcacher.LoadResponse(r)
 	if err != nil {
 		t.Errorf("unexpected error: %s", err.Error())
 	}
@@ -197,7 +213,7 @@ func TestCachedHandler(t *testing.T) {
 		t.Error("cache is nil")
 		return
 	}
-	defer cacher.Delete(r)
+	defer rcacher.DeleteResponse(r)
 
 	if want, have := "Custom message", cache.String(); want != have {
 		t.Errorf("expected %#v, got %#v", want, have)
@@ -233,11 +249,22 @@ func (handler *testHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func benchmarkCachedHandler(b *testing.B, handler http.Handler) {
 
+	if url := os.Getenv("REDIS_URL"); url == "" {
+		b.Skip("REDIS_URL not set, benchmark skipped")
+	}
+
+	redisOpts, err := redis.ParseURL(os.Getenv("REDIS_URL"))
+	if err != nil {
+		b.Errorf("invalid REDIS_URL: %s", err.Error())
+		return
+	}
+	rcacher := cacher.NewCacher(redisOpts)
+
 	// request once to activate the cache
 	w := httptest.NewRecorder()
 	r, _ := http.NewRequest("GET", "/some/path1.html", nil)
 	handler.ServeHTTP(w, r)
-	defer cacher.Delete(r)
+	defer rcacher.DeleteResponse(r)
 
 	// wait a bit for cache to handle
 	time.Sleep(500 * time.Millisecond)
@@ -278,6 +305,13 @@ func BenchmarkCachedHandler(b *testing.B) {
 		b.Skip("REDIS_URL not set, benchmark skipped")
 	}
 
+	redisOpts, err := redis.ParseURL(os.Getenv("REDIS_URL"))
+	if err != nil {
+		b.Errorf("invalid REDIS_URL: %s", err.Error())
+		return
+	}
+	rcacher := cacher.NewCacher(redisOpts)
+
 	// discard log output
 	discardLogger := kitlog.NewLogfmtLogger(ioutil.Discard)
 
@@ -290,7 +324,7 @@ func BenchmarkCachedHandler(b *testing.B) {
 
 	toTest := midway.Chain(
 		logcontext.ProvideLoggers(discardLogger, discardLogger),
-		cacher.CachedHandler,
+		cacher.CachedHandler(rcacher),
 	)(inner)
 
 	benchmarkCachedHandler(b, toTest)
