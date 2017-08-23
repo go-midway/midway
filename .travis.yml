@@ -5,5 +5,11 @@ go:
   - 1.10.x
   - master
 
+services:
+  - redis-server
+
+env:
+  - REDIS_URL=redis://localhost:6379
+
 script:
   - go test -v -cover ./...
