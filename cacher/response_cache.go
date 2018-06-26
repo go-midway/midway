@@ -85,10 +85,9 @@ func (cache *ResponseCache) Code() int {
 
 // TODO: add method to check Last-Modified date / Date of the cached response
 
-// ParseTime parses the http header field with RFC2612 format
-func (cache *ResponseCache) ParseTime(name string) (parsed time.Time, err error) {
+func parseTime(header http.Header, name string) (parsed time.Time, err error) {
 	var timeStr string
-	if timeStr = cache.Header().Get(name); timeStr == "" {
+	if timeStr = header.Get(name); timeStr == "" {
 		err = HeaderNotExists
 		return
 	}
@@ -249,7 +248,7 @@ func Valid(r *http.Request, cache *ResponseCache) bool {
 	// TODO: might support max-age somehow?
 
 	// parse grace expires override
-	if expires, err = cache.ParseTime("X-Grace-Expires"); err == nil {
+	if expires, err = parseTime(cache.Header(), "X-Grace-Expires"); err == nil {
 		if expires.After(time.Now()) {
 			logger.Log("message", "cache graced")
 			return true
@@ -258,7 +257,7 @@ func Valid(r *http.Request, cache *ResponseCache) bool {
 		logger.Error("message", fmt.Sprintf("error parsing X-Grace-Expires (%s)", err.Error()))
 	}
 
-	if expires, err = cache.ParseTime("Expires"); err == nil {
+	if expires, err = parseTime(cache.Header(), "Expires"); err == nil {
 		if expires.After(time.Now()) {
 			logger.Log("message", "cache not expired")
 			return true
