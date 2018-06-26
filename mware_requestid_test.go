@@ -10,11 +10,9 @@ import (
 )
 
 func TestHandleRequestID(t *testing.T) {
-	catchID := false
 	reqID := ""
 	srv := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if reqID = r.Header.Get("X-Request-ID"); reqID != "" {
-			catchID = true
 			fmt.Fprintf(w, "success: %s", reqID)
 			return
 		}
